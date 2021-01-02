@@ -1,0 +1,249 @@
+{-# LANGUAGE ScopedTypeVariables, FlexibleInstances #-}
+module Ristretto.RegAlloc where
+
+import Control.Monad.State
+import Data.Either
+import Data.Maybe
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict(Map,(!))
+import Data.Set (Set)
+import qualified Data.Set as Set
+
+import Ristretto.AST
+import Ristretto.Flow
+import qualified PseudoAsm as PA
+import PseudoAsm(Mem, Reg(..))
+
+import Debug.Trace
+showTrace :: Show b => b -> a -> a
+showTrace b = trace (show b)
+
+type Code = [PA.Ins]
+type Location = Either Mem Reg
+
+isReg :: Location -> Bool
+isReg = isRight
+
+class HasRegs a where
+  hasRegs :: a -> [Reg]
+
+instance HasRegs Reg where
+  hasRegs r = [r]
+
+instance HasRegs a => HasRegs [a] where
+  hasRegs = concatMap hasRegs
+
+instance (HasRegs b) => HasRegs (Either a b) where
+  hasRegs (Left a) = []
+  hasRegs (Right b) = hasRegs b
+
+instance HasRegs a => HasRegs (Set a) where
+  hasRegs = hasRegs . Set.toList
+
+class HasArgs a where
+  hasArgs :: a -> [Int]
+
+instance HasArgs Val where
+  hasArgs (VParam n ) = [n]
+  hasArgs _ = []
+
+instance HasArgs Instr where
+  hasArgs i = go i where
+    go (Iret (Just v)) = hasArgs v
+    go i@(Iassign x (EOp op v1 v2)) = hasArgs v1 ++ hasArgs v2
+    go _ = [] -- FIXME
+
+instance HasArgs a => HasArgs (Maybe a) where
+  -- hasArgs = foldMap hasArgs
+  hasArgs = maybe [] hasArgs
+
+instance HasArgs a => HasArgs [a] where
+  hasArgs = concatMap hasArgs
+
+data AState = AState {
+  ast_regdesc :: RegisterMap,
+  ast_valdesc :: ValueMap,
+  ast_locals :: Int }
+
+type RegisterMap = Map Reg RegisterDescr
+type ValueMap = Map Val (Set Location)
+
+type RegisterDescr = (RegState, Set Val)
+data RegState
+     = RegFree
+     | RegUsed
+     | RegBlocked -- used not to alloc same reg twice in one transaction
+     deriving(Eq, Ord)
+
+isRegFree, isRegBlocked :: RegisterDescr ->  Bool
+isRegFree = (RegFree==).fst
+isRegBlocked = (RegBlocked==).fst
+
+initState :: AState
+initState = AState {
+    ast_regdesc = Map.empty,
+    ast_valdesc = Map.empty,
+    ast_locals = 0 }
+
+modify_regdesc :: (RegisterMap -> RegisterMap) -> AM ()
+modify_regdesc f = modify (\s -> s { ast_regdesc = f (ast_regdesc s) })
+
+modify_valdesc :: (ValueMap -> ValueMap) -> AM ()
+modify_valdesc f = modify (\s -> s { ast_valdesc = f (ast_valdesc s) })
+
+add_valloc :: Val -> Location -> AM ()
+add_valloc val loc = modify_valdesc (Map.insertWith Set.union val (Set.singleton loc))
+  
+listFreeRegs :: RegisterMap -> [Reg]
+listFreeRegs = map fst . filter (isRegFree . snd) . Map.toList
+
+type AM = State AState
+
+runAM :: AM a -> (a, AState)
+runAM m = runState m initState
+
+evalAM :: AM a -> a
+evalAM m = evalState m initState
+
+setRegState :: RegState -> Reg -> AM ()
+setRegState newState reg = do
+  regMap <- gets ast_regdesc
+  modify_regdesc (Map.adjust modifier reg)
+    where
+      modifier (_, vals) = (newState, vals)
+
+blockReg :: Reg -> AM ()
+blockReg = setRegState RegBlocked
+
+setFree :: Reg -> AM ()
+setFree = setRegState RegFree
+
+unblockReg :: Reg -> AM ()
+unblockReg reg = do
+  regMap <- gets ast_regdesc
+  modify_regdesc (Map.adjust modifier reg) where
+    modifier (_, vals) = (if Set.null vals then RegFree else RegUsed, vals)
+
+blockRegs :: HasRegs a => a -> AM ()
+blockRegs a = mapM_ blockReg (hasRegs a)
+
+unblockRegs :: HasRegs a => a -> AM ()
+unblockRegs a = mapM_ unblockReg (hasRegs a)
+
+getFreeReg :: AM Reg
+getFreeReg = do
+  regMap <- gets ast_regdesc
+  case maybeHead $ listFreeRegs regMap of
+    Just r -> blockReg r >> return r
+    Nothing -> error "FIXME: getFreeReg: no free regs"
+
+type LiveSet = Set Int
+
+liveIn :: Val -> LiveSet -> Bool
+liveIn (VLocal n) set = Set.member n set
+liveIn (VParam n) set = Set.member (negate n) set
+
+genInstr :: Instr -> LiveSet -> LiveSet -> AM Code
+genInstr (Iret Nothing) _ _ = return [PA.Ret]
+genInstr (Iret (Just p@(VParam n))) _ _ = do
+  loc <- getValLoc' (Just $ PA.Reg 0) p
+  return $ setRetVal loc++[PA.Ret]
+genInstr (Iret (Just p@(VLocal n))) _ _ = do
+  loc <- getValLoc' (Just $ PA.Reg 0) p
+  return $ setRetVal loc++[PA.Ret]
+
+genInstr i@(Iassign x (EOp op v1 v2)) liveBefore liveAfter = do
+   showTrace (".comment", i) $ return ()
+   loc1 <- getValLoc v1
+   loc2 <- getValLoc v2
+   blockRegs [loc1, loc2]
+   r0 <- getFreeReg
+   (r1, code1) <- getIntoReg loc1
+   (r2, code2) <- getIntoReg loc2
+   let code3 = [PA.Op (show op) r0 r1 r2]
+   unblockRegs [r0, r1, r2]
+   unless (v1 `liveIn` liveAfter) $ setFree r1
+   unless (v2 `liveIn` liveAfter) $ setFree r2
+   add_valloc (VLocal x) (Right r0)
+   return $ code1++code2++code3 -- FIXME
+
+genInstr i _ _ = error $ "unimplemented: " ++ show i
+
+getIntoReg :: Location -> AM (Reg, Code)
+getIntoReg (Right r) = return (r, [])
+getIntoReg (Left m) = do
+  r <- getFreeReg
+  let code = [PA.Load r m]
+  return (r, code)
+
+genBlock = genBlock' registers Set.empty where
+  registers = map Reg [0..3]
+
+genBlock' :: [Reg]-> LiveSet -> [Instr] -> AM [PA.Ins]
+genBlock' registers liveAfterBlock is = do
+    let flow = liveSteps is
+    init is
+    -- concat <$> mapM genInstr flow
+    go flow
+  where
+    go :: [(Instr, LiveSet)] -> AM [PA.Ins]
+    go [] = return []
+    go [(i, liveBefore)] = genInstr i liveBefore liveAfterBlock
+    go ((i, liveBefore):flow@((_, liveAfter):_)) = do
+      c <- genInstr i liveBefore liveAfter
+      cs <- go flow
+      return $ c ++ cs
+
+    init :: [Instr] -> AM ()
+    init is = do
+         let argc = blockArgCount is
+         let ad n = (VParam n, Set.singleton (Left $ PA.argAddr n))
+         let ads = [ad n | n <- [1..argc]]
+         modify (\s -> s { ast_valdesc = Map.fromList ads })
+         let initRegDescrs = [(r, (RegFree, Set.empty)) | r <- registers]
+         modify (\s -> s { ast_regdesc = Map.fromList initRegDescrs })
+
+blockArgCount b = maximum (hasArgs b)
+
+
+type PreferredReg = Maybe PA.Reg
+
+getValLoc :: Val -> AM Location
+getValLoc = getValLoc' Nothing
+
+getValLoc' :: PreferredReg -> Val -> AM Location
+getValLoc' prefer val = do
+  valDesc <- gets ast_valdesc
+  case Map.lookup val valDesc >>= lookupLoc val prefer of
+    Nothing -> error $ show val ++ " not found in desc\n" ++ "valdesc: " ++ show valDesc
+    Just (loc::Location) -> return loc
+
+lookupLoc :: Val -> PreferredReg -> Set Location -> Maybe Location
+lookupLoc v pr set
+  = anyOne  $ if Set.null regLocs
+    then set
+    else regLocs where
+      regLocs = Set.filter isReg set
+
+setRetVal :: Location -> [PA.Ins]
+setRetVal (Left m) = [PA.Load (Reg 0) m]
+setRetVal (Right (PA.Reg n))
+  | n == 0 = []
+  | otherwise = [PA.Move (Reg 0) (Reg n)]
+
+testBlock1 = [Iret Nothing]
+testBlock2 = [retint (VParam 1)]
+testBlock3 = [Iassign 1 (EOp OpAdd (VParam 1) (VParam 2)), retint (VLocal 1)]
+
+test b = unlines $ map show $ evalAM (genBlock b)
+test1 = test testBlock1
+
+maybeHead :: [a] -> Maybe a
+maybeHead (x:_) = Just x
+maybeHead [] = Nothing
+
+
+anyOne :: Set a -> Maybe a
+anyOne = maybeHead . Set.toList
+
+writeln = putStrLn
